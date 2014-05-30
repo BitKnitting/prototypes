@@ -34,6 +34,17 @@ struct parameters_T
   float pHStep;
 } 
 params;
+enum UI_states_T
+{
+  INPUT_CHAR,
+  CALIBRATE,
+  CHECK_PROBE,
+  READ_PH,
+  INFO,
+  HELP,
+  INVALID_ENTRY
+}
+state;
 
 float pH;
 const float vRef = 4.096; //Our vRef into the ADC wont be exact
@@ -57,67 +68,133 @@ void setup(){
     reset_Params();
   }
   showHelp();
+  state = INPUT_CHAR;
 }
 
 void loop(){
-  int adc_result;
+  char pH_calibrating;
   //use the serial monitor to command the minipH
   if(Serial.available() ) 
   {
     char c = Serial.read();
-    if (c=='?') showHelp();
-    if(c == 'C')
+    switch(state) 
     {
-      //Which range?
-      int calrange;
-      calrange = Serial.parseInt();
-      if (calrange == 4 || calrange == 7) {
-        //take readings for pHReadCalibrationPeriod  ms
-        unsigned long currentMillis = millis();
-        lastpHCalibrationMillis = currentMillis;
-        while (currentMillis - lastpHCalibrationMillis < pHReadCalibrationPeriod) 
-        {       
-          //get a pH reading (assumes pH probe is in a calibration solution)
-          adc_result = readpH();
-          float last_pH = params.pHStep;
-          //modify the mV between pH readngs by the current adc reading
-          if( calrange == 4 ) calibratepH4(adc_result);
-          if( calrange == 7 ) calibratepH7(adc_result);
-          //add the new calibration reading to the weighted average.. putting a weight of 70% on latest additions was decided as a starting place...
-          params.pHStep  = .7 * params.pHStep + .3*last_pH;
-          Serial.print("pH Slope: ");
-          Serial.println(params.pHStep);
-          currentMillis = millis();      
-        }
-        //save the new slope so that it is available across boots
-        eeprom_write_block(&params, (void *)0, sizeof(params));
-        //if calibrating pH 7, check if the weighted average is over 30mV from the ideal 59.16mV..if it is, the probe needs to be replaced.  The slope will decrease over time.
-        if (calrange == 7) {
-          if (59.16 - params.pHStep > 30) {
-            Serial.print("---> Time to replace the pH probe.  Readings are ");
-            Serial.print(59.16-params.pHStep);
-            Serial.println(" from the 59.16mV!!!");
-          }
-        }
+    case INPUT_CHAR:
+      switch(c)
+      {
+      case 'I':
+      case 'i':
+        state=INFO;
+        break;
+      case 'C':
+      case 'c':
+        pH_calibrating = Serial.parseInt();
+        if (pH_calibrating == 4 || pH_calibrating == 7) state = CALIBRATE;
+        else state = INVALID_ENTRY;
+        break;
+      case 'p':
+      case 'P':
+        Serial.println("\nTBD: CHECK PROBE");
+        state = CHECK_PROBE;
+        break;
+      case 'r':
+      case 'R':
+        state = READ_PH;
+        break;
+      case '?':
+        state = HELP;
+        break;
+      default:
+        state=INVALID_ENTRY;
+        break;
       }
-    }
-    if(c == 'I')
-    {
-      //Lets read in our parameters and spit out the info! 
-      eeprom_read_block(&params, (void *)0, sizeof(params));
-      Serial.print("pH 7 cal: ");
-      Serial.print(params.pH7Cal);
-      Serial.print(" | ");
-      Serial.print("pH 4 cal: ");
-      Serial.print(params.pH4Cal);
-      Serial.print(" | ");
-      Serial.print("pH probe slope: ");
-      Serial.println(params.pHStep); 
+      break;
+    case CALIBRATE:
+      calibrate(pH_calibrating);
+      state = INPUT_CHAR;
+      break;
+    case CHECK_PROBE:
+      state = INPUT_CHAR;
+      break;
+    case READ_PH:
+      {
+        float pHValue = readpH();
+        Serial.print("PH is: ");
+        Serial.println(pHValue);
+      }
+      state = INPUT_CHAR;
+      break;
+    case HELP:
+      showHelp();
+      state=INPUT_CHAR;
+      break;
+    case INFO:
+      showInfo();
+      state=INPUT_CHAR;
+      break;
+    case INVALID_ENTRY:
+      Serial.println("\n\nThe character you entered is not a valid character, try one of these:");
+      showHelp();
+      state=INPUT_CHAR;
+      break;
     }
   }
 }
+float readpH() {
+  unsigned int adc = readADC();
+  return calcpH(adc);
+}
+int readADC() {    
+  Wire.requestFrom(ADDRESS, 2);       
+  byte adc_high;
+  byte adc_low;
+  adc_high = Wire.read();           
+  adc_low = Wire.read();
+  //now assemble them, remembering our byte maths a Union works well here as well
+  return (adc_high * 256) + adc_low;
+}
+//Now that we know our probe "age" we can calucalate the proper pH Its really a matter of applying the math
+//We will find our milivolts based on ADV vref and reading, then we use the 7 calibration
+//to find out how many steps that is away from 7, then apply our calibrated slope to calcualte real pH
+float calcpH(int raw)
+{
+  float miliVolts = (((float)raw/4096)*vRef)*1000;
+  float temp = ((((vRef*(float)params.pH7Cal)/4096)*1000)- miliVolts)/opampGain;
+  pH = 7-(temp/params.pHStep);
+}
 
-
+//This just simply applys defaults to the params incase the need to be reset or
+//they have never been set before (!magicnum)
+void reset_Params(void)
+{
+  //Restore to default set of parameters!
+  params.WriteCheck = Write_Check;
+  params.pH7Cal = 2048; //assume ideal probe and amp conditions 1/2 of 4096
+  params.pH4Cal = 1286; //using ideal probe slope we end up this many 12bit units away on the 4 scale
+  params.pHStep = 59.16;//ideal probe slope
+  eeprom_write_block(&params, (void *)0, sizeof(params)); //write these settings back to eeprom
+}
+void calibrate(char pHCalibrating) {
+  int adc_result;
+  unsigned long currentMillis = millis();
+  lastpHCalibrationMillis = currentMillis;
+  while (currentMillis - lastpHCalibrationMillis < pHReadCalibrationPeriod) 
+  {       
+    //get a pH reading (assumes pH probe is in a calibration solution)
+    adc_result = readADC();
+    float last_pH = params.pHStep;
+    //modify the mV between pH readngs by the current adc reading
+    if( pHCalibrating == 4 ) calibratepH4(adc_result);
+    if( pHCalibrating == 7 ) calibratepH7(adc_result);
+    //add the new calibration reading to the weighted average.. putting a weight of 70% on latest additions was decided as a starting place...
+    params.pHStep  = .7 * params.pHStep + .3*last_pH;
+    Serial.print("pH Slope: ");
+    Serial.println(params.pHStep);
+    currentMillis = millis();      
+  }
+  //write the new pH voltage step unit to EEPROM so that it is stored in 'permanent' memory
+  eeprom_write_block(&params, (void *)0, sizeof(params)); //write these settings back to eeprom
+}
 //Lets read our raw reading while in pH7 calibration fluid and store it
 //We will store in raw int formats as this math works the same on pH step calcs
 void calibratepH7(int calnum)
@@ -145,37 +222,6 @@ void calcpHSlope ()
   float pHSlope; 
   params.pHStep = ((((vRef*(float)(params.pH7Cal - params.pH4Cal))/4096)*1000)/opampGain)/3;
 }
-int readpH() {    
-  Wire.requestFrom(ADDRESS, 2);       
-  byte adc_high;
-  byte adc_low;
-  adc_high = Wire.read();           
-  adc_low = Wire.read();
-  //now assemble them, remembering our byte maths a Union works well here as well
-  return (adc_high * 256) + adc_low;
-}
-//Now that we know our probe "age" we can calucalate the proper pH Its really a matter of applying the math
-//We will find our milivolts based on ADV vref and reading, then we use the 7 calibration
-//to find out how many steps that is away from 7, then apply our calibrated slope to calcualte real pH
-void calcpH(int raw)
-{
-  float miliVolts = (((float)raw/4096)*vRef)*1000;
-  float temp = ((((vRef*(float)params.pH7Cal)/4096)*1000)- miliVolts)/opampGain;
-  pH = 7-(temp/params.pHStep);
-}
-
-//This just simply applys defaults to the params incase the need to be reset or
-//they have never been set before (!magicnum)
-void reset_Params(void)
-{
-  //Restore to default set of parameters!
-  params.WriteCheck = Write_Check;
-  params.pH7Cal = 2048; //assume ideal probe and amp conditions 1/2 of 4096
-  params.pH4Cal = 1286; //using ideal probe slope we end up this many 12bit units away on the 4 scale
-  params.pHStep = 59.16;//ideal probe slope
-  eeprom_write_block(&params, (void *)0, sizeof(params)); //write these settings back to eeprom
-}
-
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 const char helpText[] PROGMEM = 
@@ -183,6 +229,7 @@ const char helpText[] PROGMEM =
 "Available commands:" "\n"
 "  ?     - shows available comands" "\n"
 "  I     - list current values" "\n"
+"  R     - read the pH value" "\n"
 "  C4    - probe is in pH4 calibrated solution.  Start calibration" "\n"
 "  C7    - probe is in pH7 calibrated solution.  Start calibration" "\n"
 ;
@@ -202,6 +249,33 @@ static void showString (PGM_P s) {
     Serial.print(c);
   }
 }
+/*-----------------------------------------------------------
+ show info
+ -----------------------------------------------------------*/
+void showInfo() {
+  eeprom_read_block(&params, (void *)0, sizeof(params));
+  Serial.print("pH 7 ADC value: ");
+  Serial.print(params.pH7Cal);
+  Serial.print(" | ");
+  Serial.print("pH 4 ADC value: ");
+  Serial.print(params.pH4Cal);
+  Serial.print(" | ");
+  Serial.print("pH probe slope: ");
+  Serial.println(params.pHStep); 
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
