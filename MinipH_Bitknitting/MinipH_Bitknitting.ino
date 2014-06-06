@@ -4,7 +4,7 @@ This is an exploratory script to evolve the Luttuce Grower Prototype's pH featur
  ...and now - a smessage from Sparky....
  Sparky's Widgets 2012
  The usage for this design is very simple, as it uses the MCP3221 I2C ADC. Although actual
- pH calculation is done offboard the analog section is very well laid out giving great results
+ pH calculation is done offboard the analog section is very well laid out giving great resultsßßßßœ
  at varying input voltages (see vRef for adjusting this from say 5v to 3.3v).
  MinipH can operate from 2.7 to 5.5V to accomdate varying levels of system. Power VCC with 3.3v for a raspi!
  
@@ -47,7 +47,7 @@ enum UI_states_T
 state;
 
 float pH;
-const float vRef = 4.096; //Our vRef into the ADC wont be exact
+float vRef = 4.93; //Our vRef into the ADC wont be exact
 //Since you can run VCC lower than Vref its
 //best to measure and adjust here
 const float opampGain = 5.25; //what is our Op-Amps gain (stage 1)
@@ -59,10 +59,10 @@ unsigned long lastpHCalibrationMillis = 0;
 void setup(){
   Wire.begin(); //conects I2C
   Serial.begin(115200);
+  vRef = readVcc();
   //Lets read our Info from the eeprom and setup our params,
   //if we loose power or reset we'll still remember our settings!
   eeprom_read_block(&params, (void *)0, sizeof(params));
-  Serial.println(params.pHStep);
   //if its a first time setup or our magic number in eeprom is wrong reset to default
   if (params.WriteCheck != Write_Check){
     reset_Params();
@@ -86,15 +86,17 @@ void loop(){
       case 'i':
         state=INFO;
         break;
-      case 'C':
-      case 'c':
+      case '4':
+      case '7':
         pH_calibrating = Serial.parseInt();
-        if (pH_calibrating == 4 || pH_calibrating == 7) state = CALIBRATE;
-        else state = INVALID_ENTRY;
+        state = CALIBRATE;
+        break;
+      default:
+        state = INVALID_ENTRY;
         break;
       case 'p':
       case 'P':
-        Serial.println("\nTBD: CHECK PROBE");
+        Serial.println("\n***TBD: CHECK PROBE***");
         state = CHECK_PROBE;
         break;
       case 'r':
@@ -104,9 +106,6 @@ void loop(){
       case '?':
         state = HELP;
         break;
-      default:
-        state=INVALID_ENTRY;
-        break;
       }
       break;
     case CALIBRATE:
@@ -115,6 +114,14 @@ void loop(){
       break;
     case CHECK_PROBE:
       state = INPUT_CHAR;
+      {
+        long vcc = readVcc();
+        Serial.print("Vcc: ");
+        Serial.println(vcc);
+        bool probeWorks = checkProbe();
+        if (probeWorks) Serial.println("The pH Probe is GOOD");
+        else Serial.println("The pH probe NEEDS TO BE REPLACED");
+      }
       break;
     case READ_PH:
       {
@@ -162,7 +169,42 @@ float calcpH(int raw)
   float temp = ((((vRef*(float)params.pH7Cal)/4096)*1000)- miliVolts)/opampGain;
   pH = 7-(temp/params.pHStep);
 }
-
+bool checkProbe(){
+  //Assumes the probe is in the calibration solution for pH 7
+  //check to see if the measurement for pH 7 is within +/- 30mV
+  int adc_value = readADC();
+  float milliVolts = (float)adc_value*(vRef/4096);
+  //a "perfect" value is 0.  Is the value is > +/- 30mV, it needs to be replaced
+  if (milliVolts > 30. || milliVolts < -30) {
+    //probe needs to be replaced
+    return false;
+  }
+  //check to see if the amount of noise within a span of readings is acceptable
+  float last_pH_reading = 0.;
+  float avg_pH = 0.;
+  unsigned int npHReadings=0;
+  unsigned int nBadpHReadings=0;
+  unsigned long currentMillis = millis();
+  unsigned long start_probe_noise_readings_millis = currentMillis;
+  unsigned long probe_noise_reading_period = 1000; //time to take samples from the probe
+  while (currentMillis - start_probe_noise_readings_millis < probe_noise_reading_period) 
+  {       
+    //take a pH reading
+    float pH_reading = readpH();
+    avg_pH  = .7 * pH_reading + .3*last_pH_reading;
+    //don't check readings until a few have come in.  This will hopefully accomodate any initial stray readings that might happen
+    if (currentMillis > probe_noise_reading_period/4) {
+      npHReadings++;
+      if (abs(pH_reading) > 1.1*avg_pH) nBadpHReadings++;
+    } 
+    last_pH_reading = pH_reading;
+    currentMillis = millis();      
+  }
+  if ((float)nBadpHReadings/npHReadings >.1) return false;
+  //if gotten this far, the probe doesn't need to be changed
+  return true;
+}
+//were there more than 10% bad readings?
 //This just simply applys defaults to the params incase the need to be reset or
 //they have never been set before (!magicnum)
 void reset_Params(void)
@@ -230,8 +272,9 @@ const char helpText[] PROGMEM =
 "  ?     - shows available comands" "\n"
 "  I     - list current values" "\n"
 "  R     - read the pH value" "\n"
-"  C4    - probe is in pH4 calibrated solution.  Start calibration" "\n"
-"  C7    - probe is in pH7 calibrated solution.  Start calibration" "\n"
+"  4     - probe is in pH4 calibrated solution.  Start calibration" "\n"
+"  7     - probe is in pH7 calibrated solution.  Start calibration" "\n"
+"  P     - probe is in pH7 calibrated solution. Start check of Probe Health" "\n"
 ;
 /*-----------------------------------------------------------
  show command line menu
@@ -253,6 +296,8 @@ static void showString (PGM_P s) {
  show info
  -----------------------------------------------------------*/
 void showInfo() {
+  Serial.print("VREF: ");
+  Serial.print(vRef);
   eeprom_read_block(&params, (void *)0, sizeof(params));
   Serial.print("pH 7 ADC value: ");
   Serial.print(params.pH7Cal);
@@ -263,6 +308,27 @@ void showInfo() {
   Serial.print("pH probe slope: ");
   Serial.println(params.pHStep); 
 }
+
+//a smart person figured this out: https://code.google.com/p/tinkerit/wiki/SecretVoltmeter    
+//according to the doc:
+//How it works
+//The Arduino 328 and 168 have a built in precision voltage reference of 1.1V. This is used sometimes for precision measurement, although for Arduino it usually makes more sense to measure against Vcc, the positive power rail.
+//The chip has an internal switch that selects which pin the analogue to digital converter reads. That switch has a few leftover connections, so the chip designers wired them up to useful signals. One of those signals is that 1.1V reference.
+//So if you measure how large the known 1.1V reference is in comparison to Vcc, you can back-calculate what Vcc is with a little algebra. 
+long readVcc() {
+  long result;
+  // Read 1.1V reference against AVcc
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  delay(2); // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC); // Convert
+  while (bit_is_set(ADCSRA,ADSC));
+  result = ADCL;
+  result |= ADCH<<8;
+  result = 1126400L / result; // Back-calculate AVcc in mV
+  return result;
+}
+
+
 
 
 
